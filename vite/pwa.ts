@@ -45,9 +45,9 @@ export function openPencilPwaPlugin() {
       ]
     },
     manifest: {
-      name: 'OpenPencil',
-      short_name: 'OpenPencil',
-      description: 'Open-source design editor',
+      name: 'Libretech Design',
+      short_name: 'Libretech Design',
+      description: 'Open-source design editor with templates and guided learning',
       display: 'standalone',
       orientation: 'any',
       start_url: '/',

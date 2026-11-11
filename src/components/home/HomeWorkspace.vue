@@ -38,11 +38,13 @@ import DocumentDeleteDialog from '@/components/home/document/DocumentDeleteDialo
 import DocumentEntry from '@/components/home/document/DocumentEntry.vue'
 import { ofKind, type DocumentKindFilter } from '@/components/home/document/filter'
 import HomeLayout from '@/components/home/HomeLayout.vue'
+import LearnSection from '@/components/home/learn/LearnSection.vue'
 import RecentFilesSection from '@/components/home/recent/RecentFilesSection.vue'
 import RecoverySection from '@/components/home/recovery/RecoverySection.vue'
 import HomeSearchActions from '@/components/home/search/HomeSearchActions.vue'
 import HomeLocationMenu from '@/components/home/sidebar/HomeLocationMenu.vue'
 import HomeSidebar from '@/components/home/sidebar/HomeSidebar.vue'
+import TemplateSection from '@/components/home/templates/TemplateSection.vue'
 import AppButton from '@/components/ui/button/AppButton.vue'
 import IconButton from '@/components/ui/button/IconButton.vue'
 
@@ -250,6 +252,11 @@ function formattedDate(updatedAt: string): string {
       :destination="newDesignTarget?.label ?? null"
       @new-document="newDocument"
     />
+
+    <div class="mb-8 mt-5 grid gap-8">
+      <TemplateSection />
+      <LearnSection />
+    </div>
 
     <p v-if="openError" class="mb-4 text-xs text-error" role="alert">{{ openError }}</p>
     <!-- Unsaved work is this device's, so it shows in every place. -->
