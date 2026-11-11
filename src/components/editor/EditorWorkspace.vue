@@ -26,6 +26,7 @@ import { useRoomActions } from '@/components/collab-room/useRoomActions'
 import CommentDeleteDialog from '@/components/comments/CommentDeleteDialog.vue'
 import EditorCanvas from '@/components/EditorCanvas.vue'
 import LayersPanel from '@/components/LayersPanel.vue'
+import TutorialPanel from '@/components/learn/TutorialPanel.vue'
 import MobileDrawer from '@/components/MobileDrawer.vue'
 import MobileHud from '@/components/MobileHud/MobileHud.vue'
 import PropertiesPanel from '@/components/PropertiesPanel.vue'
@@ -273,6 +274,7 @@ const { pending: roomPending } = useRoomActions()
     </div>
   </div>
 
+  <TutorialPanel :tab="tab" />
   <VariablesDialog />
   <StatusesDialog />
   <CommentDeleteDialog />
