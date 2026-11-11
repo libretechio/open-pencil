@@ -2,11 +2,27 @@
 import { ref } from 'vue'
 
 import { openTour } from '@/app/demo/document'
+import { compileTutorialLesson } from '@/app/learn/compiler'
+import { startTutorialLesson } from '@/app/learn/session'
+import type { TutorialTranscript } from '@/app/learn/types'
+import { createDocumentTab } from '@/app/tabs'
 import AppButton from '@/components/ui/button/AppButton.vue'
 
 const tourOpening = ref(false)
+const compiling = ref(false)
 const error = ref<string | null>(null)
+const tutorialURL = ref('')
 const search = ref('responsive auto layout')
+
+function isTutorialTranscript(value: unknown): value is TutorialTranscript {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'videoId' in value &&
+    'segments' in value &&
+    Array.isArray(value.segments)
+  )
+}
 
 async function takeTour() {
   if (tourOpening.value) return
@@ -18,6 +34,39 @@ async function takeTour() {
     error.value = reason instanceof Error ? reason.message : String(reason)
   } finally {
     tourOpening.value = false
+  }
+}
+
+async function learnTutorial() {
+  const url = tutorialURL.value.trim()
+  if (!url || compiling.value) return
+  compiling.value = true
+  error.value = null
+  try {
+    const response = await fetch('/api/tutorials/transcript', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url })
+    })
+    const body: unknown = await response.json()
+    if (!response.ok || !isTutorialTranscript(body)) {
+      const message =
+        typeof body === 'object' &&
+        body !== null &&
+        'error' in body &&
+        typeof body.error === 'string'
+          ? body.error
+          : 'The transcript could not be loaded.'
+      throw new Error(message)
+    }
+    const lesson = compileTutorialLesson(body)
+    const tab = createDocumentTab('design')
+    tab.store.state.documentName = `Lesson: ${lesson.title}`
+    startTutorialLesson(lesson, tab.id)
+  } catch (reason) {
+    error.value = reason instanceof Error ? reason.message : String(reason)
+  } finally {
+    compiling.value = false
   }
 }
 
@@ -37,8 +86,8 @@ function searchTutorials() {
     <div class="mb-3">
       <h1 id="learn-design-title" class="text-base font-semibold">Learn by changing the file</h1>
       <p class="mt-0.5 max-w-2xl text-pretty text-xs text-muted">
-        Start with the guided OpenPencil document, then use focused practice briefs alongside your
-        own work.
+        Choose a YouTube tutorial. The tutor turns supported auto-layout instructions into document
+        checkpoints and waits for you to complete them.
       </p>
     </div>
 
@@ -46,77 +95,74 @@ function searchTutorials() {
 
     <div class="grid grid-cols-1 gap-3 lg:grid-cols-[1.2fr_0.8fr]">
       <article class="rounded-lg border border-border bg-panel p-4 sm:p-5">
-        <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div class="min-w-0">
-            <p class="text-2xs font-medium text-muted">Interactive lesson</p>
-            <h2 class="mt-1 text-sm font-semibold">OpenPencil canvas tour</h2>
-            <p class="mt-1.5 max-w-xl text-xs leading-relaxed text-muted">
-              Learn selection, layers, variables, components, code export, and the editor canvas in
-              a document built for hands-on practice.
-            </p>
-          </div>
-          <AppButton
-            variant="outline"
-            class="min-h-11 shrink-0 justify-center sm:min-h-8"
-            :loading="tourOpening"
-            @click="takeTour"
-          >
-            Open guided tour
+        <p class="text-2xs font-medium text-muted">YouTube tutorial</p>
+        <h2 class="mt-1 text-sm font-semibold">Learn this tutorial inside the editor</h2>
+        <p class="mt-1.5 max-w-xl text-xs leading-relaxed text-muted">
+          Paste a YouTube link. Libretech Design reads its available captions, keeps the video
+          attributed to its creator, and builds the checkpoints it can verify without editing your
+          work.
+        </p>
+        <form class="mt-4 grid gap-2 sm:grid-cols-[1fr_auto]" @submit.prevent="learnTutorial">
+          <label for="tutorial-url" class="sr-only">YouTube tutorial URL</label>
+          <input
+            id="tutorial-url"
+            v-model="tutorialURL"
+            type="url"
+            required
+            inputmode="url"
+            autocomplete="url"
+            class="min-h-11 min-w-0 rounded-md border border-border bg-canvas px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-panel-focus sm:min-h-8"
+            placeholder="https://www.youtube.com/watch?v=…"
+          />
+          <AppButton type="submit" class="min-h-11 justify-center sm:min-h-8" :loading="compiling">
+            Build interactive lesson
           </AppButton>
-        </div>
-
-        <div class="mt-5 grid gap-2 sm:grid-cols-3">
-          <details class="rounded-md border border-border p-3">
-            <summary class="cursor-pointer text-xs font-medium">Responsive frame</summary>
-            <ol class="mt-3 list-decimal space-y-2 ps-4 text-xs leading-relaxed text-muted">
-              <li>Create a phone frame and add a vertical auto-layout container.</li>
-              <li>Set the card width to fill and its text group to hug content.</li>
-              <li>Duplicate the frame, widen it, and inspect which constraints break.</li>
-            </ol>
-          </details>
-          <details class="rounded-md border border-border p-3">
-            <summary class="cursor-pointer text-xs font-medium">Reusable component</summary>
-            <ol class="mt-3 list-decimal space-y-2 ps-4 text-xs leading-relaxed text-muted">
-              <li>Turn one complete card into a component.</li>
-              <li>Create compact and featured variants.</li>
-              <li>Change one instance without detaching it.</li>
-            </ol>
-          </details>
-          <details class="rounded-md border border-border p-3">
-            <summary class="cursor-pointer text-xs font-medium">Design to code</summary>
-            <ol class="mt-3 list-decimal space-y-2 ps-4 text-xs leading-relaxed text-muted">
-              <li>Select the finished frame and open the Code panel.</li>
-              <li>Compare Design JSX, HTML, React, and Vue output.</li>
-              <li>Copy the smallest useful component into your coding agent.</li>
-            </ol>
-          </details>
-        </div>
+        </form>
+        <p class="mt-2 text-2xs text-muted">
+          First verifier: selected-frame auto layout, direction, gap, and equal padding. More design
+          actions will be added without weakening the read-only tutor boundary.
+        </p>
       </article>
 
-      <form
-        class="rounded-lg border border-border bg-panel p-4 sm:p-5"
-        @submit.prevent="searchTutorials"
-      >
-        <label for="tutorial-search" class="text-sm font-semibold">Search YouTube tutorials</label>
+      <article class="rounded-lg border border-border bg-panel p-4 sm:p-5">
+        <p class="text-2xs font-medium text-muted">Built-in orientation</p>
+        <h2 class="mt-1 text-sm font-semibold">OpenPencil canvas tour</h2>
         <p class="mt-1.5 text-xs leading-relaxed text-muted">
-          Search by the thing you want to build. Results open on YouTube so the original creator
-          keeps the view and attribution.
+          Learn selection, layers, variables, components, code export, and the editor canvas in a
+          prepared practice file.
         </p>
+        <AppButton
+          variant="outline"
+          class="mt-4 min-h-11 w-full justify-center sm:min-h-8"
+          :loading="tourOpening"
+          @click="takeTour"
+        >
+          Open guided tour
+        </AppButton>
+      </article>
+    </div>
+
+    <form
+      class="mt-3 flex flex-col gap-2 rounded-lg border border-border bg-panel p-4 sm:flex-row sm:items-end sm:p-5"
+      @submit.prevent="searchTutorials"
+    >
+      <div class="min-w-0 flex-1">
+        <label for="tutorial-search" class="text-xs font-medium">Find a tutorial on YouTube</label>
         <input
           id="tutorial-search"
           v-model="search"
-          class="mt-4 min-h-11 w-full rounded-md border border-border bg-canvas px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-panel-focus sm:min-h-8"
+          class="mt-2 min-h-11 w-full rounded-md border border-border bg-canvas px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-panel-focus sm:min-h-8"
           autocomplete="off"
-          placeholder="Dashboard, mobile checkout, component variants"
+          placeholder="Responsive dashboard, mobile checkout, component variants"
         />
-        <AppButton
-          type="submit"
-          variant="outline"
-          class="mt-3 min-h-11 w-full justify-center sm:min-h-8"
-        >
-          Search tutorials
-        </AppButton>
-      </form>
-    </div>
+      </div>
+      <AppButton
+        type="submit"
+        variant="outline"
+        class="min-h-11 shrink-0 justify-center sm:min-h-8"
+      >
+        Search YouTube
+      </AppButton>
+    </form>
   </section>
 </template>
