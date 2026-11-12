@@ -10,7 +10,10 @@ const PORT = Number(process.env.PORT ?? 3000)
 const YT_DLP_PATH = process.env.YT_DLP_PATH ?? 'yt-dlp'
 const MAX_BODY_BYTES = 4096
 const REQUEST_TIMEOUT_MS = Number(process.env.YOUTUBE_ATTEMPT_TIMEOUT_MS ?? 20_000)
-const EXTRACTION_DEADLINE_MS = Number(process.env.YOUTUBE_DEADLINE_MS ?? 40_000)
+// Discovery is a metadata read, so it gets a tighter ceiling: a hanging client must not
+// consume the whole budget before the next fingerprint is tried.
+const DISCOVERY_TIMEOUT_MS = Number(process.env.YOUTUBE_DISCOVERY_TIMEOUT_MS ?? 12_000)
+const EXTRACTION_DEADLINE_MS = Number(process.env.YOUTUBE_DEADLINE_MS ?? 45_000)
 // Breadth beats repetition: the ladder already covers five fingerprints, and a repeat
 // on the same client mostly adds load, which YouTube answers with 429.
 const ATTEMPTS_PER_CLIENT = Number(process.env.YOUTUBE_ATTEMPTS ?? 1)
@@ -69,9 +72,8 @@ function classifyExtractionError(stderr) {
   return 'extraction-failed'
 }
 
-function ytDlpArgs(sourceUrl, client, outputTemplate, metaPath) {
+function baseArgs(sourceUrl, client) {
   const args = [
-    '--skip-download',
     '--ignore-no-formats-error',
     '--no-warnings',
     '--no-playlist',
@@ -79,21 +81,10 @@ function ytDlpArgs(sourceUrl, client, outputTemplate, metaPath) {
     '10',
     '--retries',
     '1',
-    '--write-subs',
-    '--write-auto-subs',
-    // Explicit codes only. A wildcard also matches translated variants such as
-    // en-de-DE or en-en, which multiplies subtitle requests and earns a 429.
-    '--sub-langs',
-    'en-orig,en,en-US,en-GB',
-    '--sub-format',
-    'json3/srv3/vtt/best',
-    '--print-to-file',
-    '%(title)s\t%(uploader)s\t%(upload_date)s\t%(id)s',
-    metaPath,
+    '--add-header',
+    'Accept-Language: en-US,en;q=0.9',
     '--extractor-args',
     `youtube:player_client=${client}${POT_BASE_URL ? ';fetch_pot=always' : ''}`,
-    '-o',
-    outputTemplate,
     sourceUrl
   ]
   if (PLUGIN_DIRS) args.unshift('--plugin-dirs', PLUGIN_DIRS)
@@ -102,6 +93,46 @@ function ytDlpArgs(sourceUrl, client, outputTemplate, metaPath) {
   if (COOKIES_FILE) args.unshift('--cookies', COOKIES_FILE)
   if (PROXY_URL) args.unshift('--proxy', PROXY_URL)
   return args
+}
+
+/** Reads the caption track list without downloading anything. */
+function discoverArgs(sourceUrl, client) {
+  return ['--dump-single-json', '--skip-download', ...baseArgs(sourceUrl, client)]
+}
+
+/**
+ * Downloads one exact caption track. A language wildcard also matches translated
+ * variants (en-en, en-de-DE), and each extra track is another request that earns 429s.
+ */
+function captionArgs(sourceUrl, client, language, outputTemplate) {
+  return [
+    '--skip-download',
+    '--write-subs',
+    '--write-auto-subs',
+    '--sub-langs',
+    language,
+    '--sub-format',
+    'json3/srv3/vtt/best',
+    '-o',
+    outputTemplate,
+    ...baseArgs(sourceUrl, client)
+  ]
+}
+
+const ENGLISH_KEYS = ['en', 'en-orig', 'en-US', 'en-GB']
+
+/** Picks an English track by name, never a translation such as en-de-DE. */
+function chooseEnglishTrack(metadata) {
+  const original = Object.keys(metadata.subtitles ?? {})
+  const automatic = Object.keys(metadata.automatic_captions ?? {})
+  const keys = [...new Set([...original, ...automatic])]
+  for (const key of ENGLISH_KEYS) {
+    if (keys.includes(key)) return { language: key, keys, source: original.includes(key) ? 'human' : 'auto' }
+  }
+  const simple = keys.find((key) => /^en(-[A-Z]{2})?$/.test(key))
+  if (simple)
+    return { language: simple, keys, source: original.includes(simple) ? 'human' : 'auto' }
+  return { language: null, keys, source: null }
 }
 
 function decodeEntities(value) {
@@ -219,33 +250,39 @@ async function readCaptions(directory) {
   return { segments: [], name: null }
 }
 
-async function readMeta(directory, videoId) {
-  try {
-    const raw = await readFile(join(directory, 'meta.txt'), 'utf8')
-    const [title, creator, uploadDate, id] = raw.trim().split('\t')
-    return {
-      title: title || 'YouTube tutorial',
-      creator: creator || 'Unknown creator',
-      publishedAt: publishedDate(uploadDate),
-      id: id || videoId
-    }
-  } catch {
-    return { title: 'YouTube tutorial', creator: 'Unknown creator', publishedAt: null, id: videoId }
+function metaFrom(metadata, videoId) {
+  return {
+    id: videoId,
+    title: metadata.title || 'YouTube tutorial',
+    creator: metadata.uploader || metadata.channel || 'Unknown creator',
+    publishedAt: publishedDate(metadata.upload_date)
   }
 }
 
+async function discover(sourceUrl, client) {
+  const { stdout } = await execFileAsync(YT_DLP_PATH, discoverArgs(sourceUrl, client), {
+    timeout: DISCOVERY_TIMEOUT_MS,
+    maxBuffer: 32 * 1024 * 1024
+  })
+  return JSON.parse(stdout)
+}
+
 async function attemptWithClient(sourceUrl, client, videoId) {
+  const metadata = await discover(sourceUrl, client)
+  const { language, keys } = chooseEnglishTrack(metadata)
+  if (!language) return { ok: false, code: 'no-captions', tracks: keys }
+
   const directory = await mkdtemp(join(tmpdir(), 'libretech-tutorial-'))
-  const metaPath = join(directory, 'meta.txt')
-  const outputTemplate = join(directory, '%(id)s.%(ext)s')
   try {
-    await execFileAsync(YT_DLP_PATH, ytDlpArgs(sourceUrl, client, outputTemplate, metaPath), {
-      timeout: REQUEST_TIMEOUT_MS,
-      maxBuffer: 16 * 1024 * 1024
-    })
+    await execFileAsync(
+      YT_DLP_PATH,
+      captionArgs(sourceUrl, client, language, join(directory, '%(id)s.%(ext)s')),
+      { timeout: REQUEST_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 }
+    )
     const { segments } = await readCaptions(directory)
-    if (segments.length === 0) return { ok: false, segments }
-    return { ok: true, segments, meta: await readMeta(directory, videoId) }
+    if (segments.length === 0)
+      return { ok: false, code: 'captions-failed', tracks: keys, language }
+    return { ok: true, segments, language, meta: metaFrom(metadata, videoId) }
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
@@ -276,6 +313,7 @@ async function transcriptFor(rawUrl) {
   const started = Date.now()
   const failures = []
   let deadlineHit = false
+  let lastTracks = []
 
   for (const client of PLAYER_CLIENTS) {
     for (let attempt = 1; attempt <= ATTEMPTS_PER_CLIENT; attempt += 1) {
@@ -285,6 +323,7 @@ async function transcriptFor(rawUrl) {
       }
       try {
         const result = await attemptWithClient(sourceUrl, client, videoId)
+        lastTracks = result.tracks ?? lastTracks
         if (result.ok) {
           console.log(
             `transcript via ${client} (attempt ${attempt}), ${result.segments.length} segments`
@@ -301,7 +340,8 @@ async function transcriptFor(rawUrl) {
           cacheSet(videoId, transcript)
           return transcript
         }
-        failures.push({ client, code: 'no-captions' })
+        failures.push({ client, code: result.code ?? 'no-captions', tracks: result.tracks })
+        if (result.code === 'captions-failed') break
         break
       } catch (error) {
         const stderr = `${error?.stderr ?? ''} ${error?.message ?? ''}`
@@ -324,7 +364,12 @@ async function transcriptFor(rawUrl) {
   }
 
   const codes = new Set(failures.map((failure) => failure.code))
-  const detail = { attempts: failures, deadlineHit, elapsedMs: Date.now() - started }
+  const detail = {
+    attempts: failures,
+    deadlineHit,
+    elapsedMs: Date.now() - started,
+    captionTracks: lastTracks
+  }
   console.warn('transcript extraction failed', JSON.stringify(detail))
 
   if (codes.size === 1 && codes.has('no-captions')) {
