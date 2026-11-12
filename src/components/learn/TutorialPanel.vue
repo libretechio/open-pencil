@@ -24,6 +24,7 @@ const playerURL = computed(() => {
   const active = session.value
   const step = currentTutorialStep.value
   if (!active || !step) return ''
+  if (!/^[A-Za-z0-9_-]{11}$/.test(active.lesson.videoId)) return ''
   const start = Math.floor(step.startMs / 1000)
   return `https://www.youtube-nocookie.com/embed/${active.lesson.videoId}?start=${start}&rel=0`
 })
@@ -66,7 +67,7 @@ const canAdvance = computed(() => {
     </div>
 
     <div v-else-if="currentTutorialStep" class="overflow-y-auto">
-      <div class="aspect-video border-b border-border bg-canvas">
+      <div v-if="playerURL" class="aspect-video border-b border-border bg-canvas">
         <iframe
           class="size-full"
           :src="playerURL"
@@ -77,9 +78,14 @@ const canAdvance = computed(() => {
       </div>
       <div class="p-4">
         <p class="text-xs leading-relaxed">{{ currentTutorialStep.instruction }}</p>
+        <p v-if="!playerURL" class="mt-2 text-2xs text-muted">
+          This lesson was built from a pasted transcript, so no video is attached.
+        </p>
         <p class="mt-2 text-2xs text-muted">
-          Video segment starts at {{ Math.floor(currentTutorialStep.startMs / 1000) }}s. The tutor
-          only reads the selected layer; it never edits your file.
+          <template v-if="playerURL">
+            Video segment starts at {{ Math.floor(currentTutorialStep.startMs / 1000) }}s.
+          </template>
+          The tutor only reads the selected layer; it never edits your file.
         </p>
 
         <div

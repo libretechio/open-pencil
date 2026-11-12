@@ -4,6 +4,7 @@ import { ref } from 'vue'
 import { openTour } from '@/app/demo/document'
 import { compileTutorialLesson } from '@/app/learn/compiler'
 import { startTutorialLesson } from '@/app/learn/session'
+import { transcriptFromCaptions } from '@/app/learn/transcript'
 import type { TutorialTranscript } from '@/app/learn/types'
 import { createDocumentTab } from '@/app/tabs'
 import AppButton from '@/components/ui/button/AppButton.vue'
@@ -13,6 +14,8 @@ const compiling = ref(false)
 const error = ref<string | null>(null)
 const tutorialURL = ref('')
 const search = ref('responsive auto layout')
+const pasteOpen = ref(false)
+const pastedCaptions = ref('')
 
 function isTutorialTranscript(value: unknown): value is TutorialTranscript {
   return (
@@ -22,6 +25,24 @@ function isTutorialTranscript(value: unknown): value is TutorialTranscript {
     'segments' in value &&
     Array.isArray(value.segments)
   )
+}
+
+function messageFrom(body: unknown, fallback: string): string {
+  return typeof body === 'object' &&
+    body !== null &&
+    'error' in body &&
+    typeof body.error === 'string'
+    ? body.error
+    : fallback
+}
+
+function codeFrom(body: unknown): string | null {
+  return typeof body === 'object' &&
+    body !== null &&
+    'code' in body &&
+    typeof body.code === 'string'
+    ? body.code
+    : null
 }
 
 async function takeTour() {
@@ -37,6 +58,13 @@ async function takeTour() {
   }
 }
 
+function startLesson(transcript: TutorialTranscript) {
+  const lesson = compileTutorialLesson(transcript)
+  const tab = createDocumentTab('design')
+  tab.store.state.documentName = `Lesson: ${lesson.title}`
+  startTutorialLesson(lesson, tab.id)
+}
+
 async function learnTutorial() {
   const url = tutorialURL.value.trim()
   if (!url || compiling.value) return
@@ -50,19 +78,30 @@ async function learnTutorial() {
     })
     const body: unknown = await response.json()
     if (!response.ok || !isTutorialTranscript(body)) {
-      const message =
-        typeof body === 'object' &&
-        body !== null &&
-        'error' in body &&
-        typeof body.error === 'string'
-          ? body.error
-          : 'The transcript could not be loaded.'
-      throw new Error(message)
+      const code = codeFrom(body)
+      if (code === 'youtube-blocked' || code === 'no-captions') pasteOpen.value = true
+      throw new Error(messageFrom(body, 'The transcript could not be loaded.'))
     }
-    const lesson = compileTutorialLesson(body)
-    const tab = createDocumentTab('design')
-    tab.store.state.documentName = `Lesson: ${lesson.title}`
-    startTutorialLesson(lesson, tab.id)
+    startLesson(body)
+  } catch (reason) {
+    error.value = reason instanceof Error ? reason.message : String(reason)
+  } finally {
+    compiling.value = false
+  }
+}
+
+function buildFromCaptions() {
+  if (compiling.value) return
+  error.value = null
+  compiling.value = true
+  try {
+    startLesson(
+      transcriptFromCaptions({
+        captions: pastedCaptions.value,
+        url: tutorialURL.value,
+        title: tutorialURL.value.trim() ? undefined : 'Pasted tutorial transcript'
+      })
+    )
   } catch (reason) {
     error.value = reason instanceof Error ? reason.message : String(reason)
   } finally {
@@ -118,6 +157,51 @@ function searchTutorials() {
             Build interactive lesson
           </AppButton>
         </form>
+
+        <p v-if="compiling" class="mt-2 text-2xs text-muted" role="status">
+          Reading the captions. This can take up to 30 seconds.
+        </p>
+        <div class="mt-3 rounded-md border border-border bg-canvas p-3">
+          <button
+            type="button"
+            class="flex min-h-9 w-full items-center justify-between gap-2 text-start text-xs font-medium"
+            :aria-expanded="pasteOpen"
+            aria-controls="paste-transcript-panel"
+            @click="pasteOpen = !pasteOpen"
+          >
+            <span>Paste a transcript instead</span>
+            <icon-lucide-chevron-down
+              class="size-3.5 shrink-0 text-muted transition-transform"
+              :class="pasteOpen ? 'rotate-180' : ''"
+            />
+          </button>
+          <div v-if="pasteOpen" id="paste-transcript-panel" class="mt-3">
+            <p class="text-2xs leading-relaxed text-muted">
+              Use this when YouTube will not hand over the captions. Open the video, choose
+              <span class="font-medium text-primary">Show transcript</span>, copy the panel, and
+              paste it here. Captions copied as VTT or SRT work too.
+            </p>
+            <label for="pasted-captions" class="mt-3 block text-2xs font-medium text-muted">
+              Tutorial transcript
+            </label>
+            <textarea
+              id="pasted-captions"
+              v-model="pastedCaptions"
+              rows="5"
+              class="mt-1.5 w-full resize-y rounded-md border border-border bg-canvas px-3 py-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-panel-focus"
+              placeholder="0:12&#10;select both cards and press shift a to add auto layout&#10;0:20&#10;set the gap to 16"
+            />
+            <AppButton
+              variant="outline"
+              class="mt-2 min-h-11 w-full justify-center sm:min-h-8"
+              :disabled="!pastedCaptions.trim()"
+              @click="buildFromCaptions"
+            >
+              Build lesson from pasted transcript
+            </AppButton>
+          </div>
+        </div>
+
         <p class="mt-2 text-2xs text-muted">
           First verifier: selected-frame auto layout, direction, gap, and equal padding. More design
           actions will be added without weakening the read-only tutor boundary.
