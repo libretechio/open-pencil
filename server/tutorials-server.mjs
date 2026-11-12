@@ -19,6 +19,9 @@ const EXTRACTION_DEADLINE_MS = Number(process.env.YOUTUBE_DEADLINE_MS ?? 45_000)
 const ATTEMPTS_PER_CLIENT = Number(process.env.YOUTUBE_ATTEMPTS ?? 1)
 const CACHE_TTL_MS = 60 * 60 * 1000
 const CACHE_LIMIT = 50
+// Repeated fetches of the same failing video make YouTube's answer worse, so a
+// failure is remembered instead of retried on every click.
+const FAILURE_TTL_MS = Number(process.env.YOUTUBE_FAILURE_TTL_MS ?? 10 * 60 * 1000)
 
 const COOKIES_FILE = process.env.YOUTUBE_COOKIES_FILE ?? ''
 const PROXY_URL = process.env.YOUTUBE_PROXY_URL ?? ''
@@ -36,6 +39,8 @@ const PLAYER_CLIENTS = (process.env.YOUTUBE_PLAYER_CLIENTS ?? DEFAULT_CLIENTS)
   .filter(Boolean)
 
 const transcriptCache = new Map()
+const failureCache = new Map()
+const inFlight = new Map()
 
 function youtubeId(rawUrl) {
   const url = new URL(rawUrl)
@@ -300,8 +305,26 @@ function cacheGet(key) {
 
 function cacheSet(key, value) {
   transcriptCache.set(key, { at: Date.now(), value })
+  failureCache.delete(key)
   while (transcriptCache.size > CACHE_LIMIT) {
     transcriptCache.delete(transcriptCache.keys().next().value)
+  }
+}
+
+function failureGet(key) {
+  const hit = failureCache.get(key)
+  if (!hit) return null
+  if (Date.now() - hit.at > FAILURE_TTL_MS) {
+    failureCache.delete(key)
+    return null
+  }
+  return { ...hit, retryAfterSeconds: Math.ceil((hit.at + FAILURE_TTL_MS - Date.now()) / 1000) }
+}
+
+function failureSet(key, code, message) {
+  failureCache.set(key, { at: Date.now(), code, message })
+  while (failureCache.size > CACHE_LIMIT) {
+    failureCache.delete(failureCache.keys().next().value)
   }
 }
 
@@ -309,6 +332,21 @@ async function transcriptFor(rawUrl) {
   const videoId = youtubeId(rawUrl)
   const cached = cacheGet(videoId)
   if (cached) return cached
+  const known = failureGet(videoId)
+  if (known) {
+    throw new TranscriptError(known.message, known.code, {
+      cachedFailure: true,
+      retryAfterSeconds: known.retryAfterSeconds
+    })
+  }
+  const running = inFlight.get(videoId)
+  if (running) return running
+  const attempt = extractTranscript(videoId).finally(() => inFlight.delete(videoId))
+  inFlight.set(videoId, attempt)
+  return attempt
+}
+
+async function extractTranscript(videoId) {
   const sourceUrl = `https://www.youtube.com/watch?v=${videoId}`
   const started = Date.now()
   const failures = []
@@ -373,13 +411,19 @@ async function transcriptFor(rawUrl) {
   console.warn('transcript extraction failed', JSON.stringify(detail))
 
   if (codes.size === 1 && codes.has('no-captions')) {
-    throw new TranscriptError(
-      'This video has no English captions that the tutor can read. Paste the transcript instead.',
-      'no-captions',
-      detail
-    )
+    const message =
+      lastTracks.length === 0
+        ? 'YouTube returned no caption tracks for this video to this server. Paste the transcript instead.'
+        : 'This video has no English captions that the tutor can read. Paste the transcript instead.'
+    failureSet(videoId, 'no-captions', message)
+    throw new TranscriptError(message, 'no-captions', detail)
   }
   if (codes.size === 1 && codes.has('rate-limited')) {
+    failureSet(
+      videoId,
+      'rate-limited',
+      'YouTube is rate-limiting caption downloads from this server. Wait a minute and try again, or paste the transcript.'
+    )
     throw new TranscriptError(
       'YouTube is rate-limiting caption downloads from this server. Wait a minute and try again, or paste the transcript.',
       'rate-limited',
@@ -394,17 +438,21 @@ async function transcriptFor(rawUrl) {
     )
   }
   if (deadlineHit) {
+    failureSet(
+      videoId,
+      'timeout',
+      'YouTube took too long to answer. Try again, or paste the transcript to skip the wait.'
+    )
     throw new TranscriptError(
       'YouTube took too long to answer. Try again, or paste the transcript to skip the wait.',
       'timeout',
       detail
     )
   }
-  throw new TranscriptError(
-    "YouTube is refusing this server's transcript requests right now. Paste the video's transcript below and the tutor will build the same lesson.",
-    'youtube-blocked',
-    detail
-  )
+  const blocked =
+    "YouTube is refusing this server's transcript requests right now. Paste the video's transcript below and the tutor will build the same lesson."
+  failureSet(videoId, 'youtube-blocked', blocked)
+  throw new TranscriptError(blocked, 'youtube-blocked', detail)
 }
 
 function json(response, status, body) {
