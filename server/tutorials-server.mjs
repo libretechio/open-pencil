@@ -9,9 +9,11 @@ const execFileAsync = promisify(execFile)
 const PORT = Number(process.env.PORT ?? 3000)
 const YT_DLP_PATH = process.env.YT_DLP_PATH ?? 'yt-dlp'
 const MAX_BODY_BYTES = 4096
-const REQUEST_TIMEOUT_MS = 20_000
-const EXTRACTION_DEADLINE_MS = Number(process.env.YOUTUBE_DEADLINE_MS ?? 30_000)
-const ATTEMPTS_PER_CLIENT = Number(process.env.YOUTUBE_ATTEMPTS ?? 2)
+const REQUEST_TIMEOUT_MS = Number(process.env.YOUTUBE_ATTEMPT_TIMEOUT_MS ?? 20_000)
+const EXTRACTION_DEADLINE_MS = Number(process.env.YOUTUBE_DEADLINE_MS ?? 40_000)
+// Breadth beats repetition: the ladder already covers five fingerprints, and a repeat
+// on the same client mostly adds load, which YouTube answers with 429.
+const ATTEMPTS_PER_CLIENT = Number(process.env.YOUTUBE_ATTEMPTS ?? 1)
 const CACHE_TTL_MS = 60 * 60 * 1000
 const CACHE_LIMIT = 50
 
@@ -48,19 +50,22 @@ function youtubeId(rawUrl) {
 }
 
 class TranscriptError extends Error {
-  constructor(message, code) {
+  constructor(message, code, detail) {
     super(message)
     this.code = code
+    this.detail = detail
   }
 }
 
 function classifyExtractionError(stderr) {
   if (/confirm you'?re not a bot|sign in to confirm|cookies/i.test(stderr)) return 'youtube-blocked'
-  if (/429|too many requests|rate.?limit/i.test(stderr)) return 'youtube-blocked'
+  if (/429|too many requests|rate.?limit/i.test(stderr)) return 'rate-limited'
   if (/private video|video unavailable|has been removed|members-only/i.test(stderr))
     return 'video-unavailable'
   if (/no such video|does not exist|invalid video/i.test(stderr)) return 'video-unavailable'
-  if (/no subtitles|did not get any data blocks/i.test(stderr)) return 'no-captions'
+  if (/no subtitles|there are no subtitles/i.test(stderr)) return 'no-captions'
+  if (/did not get any data blocks|unable to download video data/i.test(stderr))
+    return 'captions-failed'
   return 'extraction-failed'
 }
 
@@ -76,8 +81,10 @@ function ytDlpArgs(sourceUrl, client, outputTemplate, metaPath) {
     '1',
     '--write-subs',
     '--write-auto-subs',
+    // Explicit codes only. A wildcard also matches translated variants such as
+    // en-de-DE or en-en, which multiplies subtitle requests and earns a 429.
     '--sub-langs',
-    'en.*,en',
+    'en-orig,en,en-US,en-GB',
     '--sub-format',
     'json3/srv3/vtt/best',
     '--print-to-file',
@@ -90,7 +97,8 @@ function ytDlpArgs(sourceUrl, client, outputTemplate, metaPath) {
     sourceUrl
   ]
   if (PLUGIN_DIRS) args.unshift('--plugin-dirs', PLUGIN_DIRS)
-  if (POT_BASE_URL) args.unshift('--extractor-args', `youtubepot-bgutilhttp:base_url=${POT_BASE_URL}`)
+  if (POT_BASE_URL)
+    args.unshift('--extractor-args', `youtubepot-bgutilhttp:base_url=${POT_BASE_URL}`)
   if (COOKIES_FILE) args.unshift('--cookies', COOKIES_FILE)
   if (PROXY_URL) args.unshift('--proxy', PROXY_URL)
   return args
@@ -267,11 +275,14 @@ async function transcriptFor(rawUrl) {
   const sourceUrl = `https://www.youtube.com/watch?v=${videoId}`
   const started = Date.now()
   const failures = []
-  let sawNoCaptions = false
+  let deadlineHit = false
 
   for (const client of PLAYER_CLIENTS) {
     for (let attempt = 1; attempt <= ATTEMPTS_PER_CLIENT; attempt += 1) {
-      if (Date.now() - started > EXTRACTION_DEADLINE_MS) break
+      if (Date.now() - started > EXTRACTION_DEADLINE_MS) {
+        deadlineHit = true
+        break
+      }
       try {
         const result = await attemptWithClient(sourceUrl, client, videoId)
         if (result.ok) {
@@ -290,7 +301,6 @@ async function transcriptFor(rawUrl) {
           cacheSet(videoId, transcript)
           return transcript
         }
-        sawNoCaptions = true
         failures.push({ client, code: 'no-captions' })
         break
       } catch (error) {
@@ -303,26 +313,52 @@ async function transcriptFor(rawUrl) {
             code
           )
         }
-        if (code === 'no-captions') {
-          sawNoCaptions = true
-          break
-        }
+        if (code === 'no-captions' || code === 'video-unavailable') break
         if (attempt < ATTEMPTS_PER_CLIENT) await new Promise((r) => setTimeout(r, 1200 * attempt))
       }
     }
-    if (Date.now() - started > EXTRACTION_DEADLINE_MS) break
+    if (Date.now() - started > EXTRACTION_DEADLINE_MS) {
+      deadlineHit = true
+      break
+    }
   }
 
-  if (sawNoCaptions && failures.every((failure) => failure.code === 'no-captions')) {
+  const codes = new Set(failures.map((failure) => failure.code))
+  const detail = { attempts: failures, deadlineHit, elapsedMs: Date.now() - started }
+  console.warn('transcript extraction failed', JSON.stringify(detail))
+
+  if (codes.size === 1 && codes.has('no-captions')) {
     throw new TranscriptError(
       'This video has no English captions that the tutor can read. Paste the transcript instead.',
-      'no-captions'
+      'no-captions',
+      detail
     )
   }
-  console.warn('transcript extraction failed', JSON.stringify(failures))
+  if (codes.size === 1 && codes.has('rate-limited')) {
+    throw new TranscriptError(
+      'YouTube is rate-limiting caption downloads from this server. Wait a minute and try again, or paste the transcript.',
+      'rate-limited',
+      detail
+    )
+  }
+  if (codes.size === 1 && codes.has('captions-failed')) {
+    throw new TranscriptError(
+      "YouTube returned this video's player but not its caption file. Paste the transcript instead, or try again shortly.",
+      'captions-failed',
+      detail
+    )
+  }
+  if (deadlineHit) {
+    throw new TranscriptError(
+      'YouTube took too long to answer. Try again, or paste the transcript to skip the wait.',
+      'timeout',
+      detail
+    )
+  }
   throw new TranscriptError(
     "YouTube is refusing this server's transcript requests right now. Paste the video's transcript below and the tutor will build the same lesson.",
-    'youtube-blocked'
+    'youtube-blocked',
+    detail
   )
 }
 
@@ -373,7 +409,8 @@ createServer(async (request, response) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     const code = error instanceof TranscriptError ? error.code : 'invalid-request'
-    json(response, code === 'invalid-request' ? 400 : 422, { error: message, code })
+    const detail = error instanceof TranscriptError ? (error.detail ?? null) : null
+    json(response, code === 'invalid-request' ? 400 : 422, { error: message, code, detail })
   }
 }).listen(PORT, '0.0.0.0', () => {
   console.log(

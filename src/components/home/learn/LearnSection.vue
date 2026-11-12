@@ -79,7 +79,8 @@ async function learnTutorial() {
     const body: unknown = await response.json()
     if (!response.ok || !isTutorialTranscript(body)) {
       const code = codeFrom(body)
-      if (code === 'youtube-blocked' || code === 'no-captions') pasteOpen.value = true
+      // Every caption failure is recoverable by pasting, so always offer it.
+      if (code !== null && code !== 'invalid-request') pasteOpen.value = true
       throw new Error(messageFrom(body, 'The transcript could not be loaded.'))
     }
     startLesson(body)
