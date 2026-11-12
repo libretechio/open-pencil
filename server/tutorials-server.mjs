@@ -1,5 +1,8 @@
 import { execFile } from 'node:child_process'
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
@@ -12,16 +15,20 @@ const ATTEMPTS_PER_CLIENT = Number(process.env.YOUTUBE_ATTEMPTS ?? 2)
 const CACHE_TTL_MS = 60 * 60 * 1000
 const CACHE_LIMIT = 50
 
+const COOKIES_FILE = process.env.YOUTUBE_COOKIES_FILE ?? ''
+const PROXY_URL = process.env.YOUTUBE_PROXY_URL ?? ''
+// A PO token provider defeats YouTube's datacenter bot check without an account.
+const PLUGIN_DIRS = process.env.YT_DLP_PLUGIN_DIRS ?? ''
+const POT_BASE_URL = process.env.YT_DLP_POT_BASE_URL ?? ''
+
 // YouTube bot-checks anonymous datacenter IPs unevenly across player clients, so a single
 // extraction strategy fails intermittently. Each client is a different request fingerprint.
-const PLAYER_CLIENTS = (
-  process.env.YOUTUBE_PLAYER_CLIENTS ?? 'default,android_vr,web_safari,tv_simply,web_embedded'
-)
+// Clients that hand out caption files without an extra token are tried first.
+const DEFAULT_CLIENTS = 'android_vr,tv_simply,default,web_safari,web_embedded'
+const PLAYER_CLIENTS = (process.env.YOUTUBE_PLAYER_CLIENTS ?? DEFAULT_CLIENTS)
   .split(',')
   .map((client) => client.trim())
   .filter(Boolean)
-const COOKIES_FILE = process.env.YOUTUBE_COOKIES_FILE ?? ''
-const PROXY_URL = process.env.YOUTUBE_PROXY_URL ?? ''
 
 const transcriptCache = new Map()
 
@@ -53,92 +60,40 @@ function classifyExtractionError(stderr) {
   if (/private video|video unavailable|has been removed|members-only/i.test(stderr))
     return 'video-unavailable'
   if (/no such video|does not exist|invalid video/i.test(stderr)) return 'video-unavailable'
+  if (/no subtitles|did not get any data blocks/i.test(stderr)) return 'no-captions'
   return 'extraction-failed'
 }
 
-function ytDlpArgs(sourceUrl, client) {
+function ytDlpArgs(sourceUrl, client, outputTemplate, metaPath) {
   const args = [
-    '--dump-single-json',
     '--skip-download',
+    '--ignore-no-formats-error',
     '--no-warnings',
     '--no-playlist',
-    '--ignore-no-formats-error',
     '--socket-timeout',
     '10',
     '--retries',
     '1',
+    '--write-subs',
+    '--write-auto-subs',
+    '--sub-langs',
+    'en.*,en',
+    '--sub-format',
+    'json3/srv3/vtt/best',
+    '--print-to-file',
+    '%(title)s\t%(uploader)s\t%(upload_date)s\t%(id)s',
+    metaPath,
     '--extractor-args',
-    `youtube:player_client=${client}`,
+    `youtube:player_client=${client}${POT_BASE_URL ? ';fetch_pot=always' : ''}`,
+    '-o',
+    outputTemplate,
     sourceUrl
   ]
+  if (PLUGIN_DIRS) args.unshift('--plugin-dirs', PLUGIN_DIRS)
+  if (POT_BASE_URL) args.unshift('--extractor-args', `youtubepot-bgutilhttp:base_url=${POT_BASE_URL}`)
   if (COOKIES_FILE) args.unshift('--cookies', COOKIES_FILE)
   if (PROXY_URL) args.unshift('--proxy', PROXY_URL)
   return args
-}
-
-async function metadataWithClient(sourceUrl, client) {
-  const { stdout } = await execFileAsync(YT_DLP_PATH, ytDlpArgs(sourceUrl, client), {
-    timeout: REQUEST_TIMEOUT_MS,
-    maxBuffer: 16 * 1024 * 1024
-  })
-  return JSON.parse(stdout)
-}
-
-function hasCaptions(metadata) {
-  return Array.isArray(metadata.subtitles?.en) || Array.isArray(metadata.automatic_captions?.en)
-}
-
-async function metadataFor(sourceUrl) {
-  const started = Date.now()
-  const failures = []
-  for (const client of PLAYER_CLIENTS) {
-    for (let attempt = 1; attempt <= ATTEMPTS_PER_CLIENT; attempt += 1) {
-      if (Date.now() - started > EXTRACTION_DEADLINE_MS) break
-      try {
-        const metadata = await metadataWithClient(sourceUrl, client)
-        if (hasCaptions(metadata)) {
-          console.log(`transcript metadata via ${client} (attempt ${attempt})`)
-          return metadata
-        }
-        failures.push({ client, code: 'no-captions', message: 'no English captions' })
-        break
-      } catch (error) {
-        const stderr = `${error?.stderr ?? ''} ${error?.message ?? ''}`
-        const code = classifyExtractionError(stderr)
-        failures.push({ client, code, message: stderr.trim().split('\n').at(-1)?.slice(0, 200) })
-        if (code === 'video-unavailable') {
-          throw new TranscriptError(
-            'This video is unavailable or private, so the tutor cannot read its captions.',
-            code
-          )
-        }
-        if (attempt < ATTEMPTS_PER_CLIENT) await new Promise((r) => setTimeout(r, 1200 * attempt))
-      }
-    }
-    if (Date.now() - started > EXTRACTION_DEADLINE_MS) break
-  }
-  if (failures.some((failure) => failure.code === 'no-captions')) {
-    throw new TranscriptError(
-      'This video has no English captions that the tutor can read. Paste the transcript instead.',
-      'no-captions'
-    )
-  }
-  console.warn('transcript extraction failed', JSON.stringify(failures))
-  throw new TranscriptError(
-    "YouTube is refusing this server's transcript requests right now. Paste the video's transcript below and the tutor will build the same lesson.",
-    'youtube-blocked'
-  )
-}
-
-function captionTrack(metadata) {
-  const tracks = metadata.subtitles?.en ?? metadata.automatic_captions?.en
-  if (!Array.isArray(tracks)) return null
-  return (
-    tracks.find((track) => track.ext === 'json3') ??
-    tracks.find((track) => track.ext === 'srv3') ??
-    tracks.find((track) => track.ext === 'vtt') ??
-    tracks[0]
-  )
 }
 
 function decodeEntities(value) {
@@ -184,6 +139,16 @@ function segmentsFromSrv3(xml) {
   return segments
 }
 
+function timecodeToMs(value) {
+  const parts = value.trim().replace(',', '.').split(':')
+  if (parts.length < 2) return null
+  const seconds = Number(parts.at(-1))
+  const minutes = Number(parts.at(-2))
+  const hours = parts.length > 2 ? Number(parts.at(-3)) : 0
+  if (![seconds, minutes, hours].every(Number.isFinite)) return null
+  return Math.round((hours * 3600 + minutes * 60 + seconds) * 1000)
+}
+
 function segmentsFromVtt(vtt) {
   const segments = []
   const blocks = vtt.replace(/\r/g, '').split('\n\n')
@@ -191,8 +156,7 @@ function segmentsFromVtt(vtt) {
     const lines = block.split('\n').filter(Boolean)
     const timingIndex = lines.findIndex((line) => line.includes('-->'))
     if (timingIndex === -1) continue
-    const start = lines[timingIndex].split('-->')[0]?.trim() ?? ''
-    const startMs = timecodeToMs(start)
+    const startMs = timecodeToMs(lines[timingIndex].split('-->')[0] ?? '')
     if (startMs === null) continue
     const text = decodeEntities(
       lines
@@ -207,52 +171,76 @@ function segmentsFromVtt(vtt) {
   return segments
 }
 
-function timecodeToMs(value) {
-  const parts = value.trim().replace(',', '.').split(':')
-  if (parts.length < 2) return null
-  const seconds = Number(parts.at(-1))
-  const minutes = Number(parts.at(-2))
-  const hours = parts.length > 2 ? Number(parts.at(-3)) : 0
-  if (![seconds, minutes, hours].every(Number.isFinite)) return null
-  return Math.round((hours * 3600 + minutes * 60 + seconds) * 1000)
+function parseCaptionFile(name, body) {
+  if (name.endsWith('.json3')) return segmentsFromJson3(JSON.parse(body))
+  if (name.endsWith('.srv3') || name.endsWith('.xml')) return segmentsFromSrv3(body)
+  return segmentsFromVtt(body)
 }
 
-async function captionsFor(track) {
-  const formats = ['json3', 'srv3', 'vtt']
-  const preferred = track.ext && formats.includes(track.ext) ? track.ext : 'json3'
-  const ordered = [preferred, ...formats.filter((format) => format !== preferred)]
-  for (const format of ordered) {
-    const base = track.url.replace(/&fmt=[a-z0-9]+/i, '')
-    const url = `${base}&fmt=${format}`
-    try {
-      const response = await fetch(url, {
-        headers: {
-          'user-agent':
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          'accept-language': 'en-US,en;q=0.9'
-        },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-      })
-      if (!response.ok) continue
-      const body = await response.text()
-      if (!body.trim()) continue
-      const segments =
-        format === 'json3'
-          ? segmentsFromJson3(JSON.parse(body))
-          : format === 'srv3'
-            ? segmentsFromSrv3(body)
-            : segmentsFromVtt(body)
-      if (segments.length > 0) return segments
-    } catch {
-      continue
-    }
+// Prefer the original English track, then ASR English, then whatever yt-dlp wrote.
+function captionFileOrder(names) {
+  const rank = (name) => {
+    if (name.endsWith('.en.json3')) return 0
+    if (name.endsWith('.json3')) return 1
+    if (name.endsWith('.en.srv3') || name.endsWith('.en.xml')) return 2
+    if (name.endsWith('.srv3') || name.endsWith('.xml')) return 3
+    if (name.endsWith('.en.vtt')) return 4
+    return 5
   }
-  return []
+  return [...names].sort((a, b) => rank(a) - rank(b))
 }
 
 function publishedDate(value) {
   if (typeof value !== 'string' || !/^\d{8}$/.test(value)) return null
   return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`
+}
+
+async function readCaptions(directory) {
+  const names = await readdir(directory)
+  const candidates = captionFileOrder(names.filter((name) => !name.endsWith('.part')))
+  for (const name of candidates) {
+    if (name === 'meta.txt') continue
+    try {
+      const body = await readFile(join(directory, name), 'utf8')
+      const segments = parseCaptionFile(name, body)
+      if (segments.length > 0) return { segments, name }
+    } catch {
+      continue
+    }
+  }
+  return { segments: [], name: null }
+}
+
+async function readMeta(directory, videoId) {
+  try {
+    const raw = await readFile(join(directory, 'meta.txt'), 'utf8')
+    const [title, creator, uploadDate, id] = raw.trim().split('\t')
+    return {
+      title: title || 'YouTube tutorial',
+      creator: creator || 'Unknown creator',
+      publishedAt: publishedDate(uploadDate),
+      id: id || videoId
+    }
+  } catch {
+    return { title: 'YouTube tutorial', creator: 'Unknown creator', publishedAt: null, id: videoId }
+  }
+}
+
+async function attemptWithClient(sourceUrl, client, videoId) {
+  const directory = await mkdtemp(join(tmpdir(), 'libretech-tutorial-'))
+  const metaPath = join(directory, 'meta.txt')
+  const outputTemplate = join(directory, '%(id)s.%(ext)s')
+  try {
+    await execFileAsync(YT_DLP_PATH, ytDlpArgs(sourceUrl, client, outputTemplate, metaPath), {
+      timeout: REQUEST_TIMEOUT_MS,
+      maxBuffer: 16 * 1024 * 1024
+    })
+    const { segments } = await readCaptions(directory)
+    if (segments.length === 0) return { ok: false, segments }
+    return { ok: true, segments, meta: await readMeta(directory, videoId) }
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
 }
 
 function cacheGet(key) {
@@ -277,32 +265,65 @@ async function transcriptFor(rawUrl) {
   const cached = cacheGet(videoId)
   if (cached) return cached
   const sourceUrl = `https://www.youtube.com/watch?v=${videoId}`
-  const metadata = await metadataFor(sourceUrl)
-  const track = captionTrack(metadata)
-  if (!track) {
+  const started = Date.now()
+  const failures = []
+  let sawNoCaptions = false
+
+  for (const client of PLAYER_CLIENTS) {
+    for (let attempt = 1; attempt <= ATTEMPTS_PER_CLIENT; attempt += 1) {
+      if (Date.now() - started > EXTRACTION_DEADLINE_MS) break
+      try {
+        const result = await attemptWithClient(sourceUrl, client, videoId)
+        if (result.ok) {
+          console.log(
+            `transcript via ${client} (attempt ${attempt}), ${result.segments.length} segments`
+          )
+          const transcript = {
+            videoId,
+            sourceUrl,
+            title: result.meta.title,
+            creator: result.meta.creator,
+            publishedAt: result.meta.publishedAt,
+            language: 'en',
+            segments: result.segments
+          }
+          cacheSet(videoId, transcript)
+          return transcript
+        }
+        sawNoCaptions = true
+        failures.push({ client, code: 'no-captions' })
+        break
+      } catch (error) {
+        const stderr = `${error?.stderr ?? ''} ${error?.message ?? ''}`
+        const code = classifyExtractionError(stderr)
+        failures.push({ client, code, message: stderr.trim().split('\n').at(-1)?.slice(0, 200) })
+        if (code === 'video-unavailable') {
+          throw new TranscriptError(
+            'This video is unavailable or private, so the tutor cannot read its captions.',
+            code
+          )
+        }
+        if (code === 'no-captions') {
+          sawNoCaptions = true
+          break
+        }
+        if (attempt < ATTEMPTS_PER_CLIENT) await new Promise((r) => setTimeout(r, 1200 * attempt))
+      }
+    }
+    if (Date.now() - started > EXTRACTION_DEADLINE_MS) break
+  }
+
+  if (sawNoCaptions && failures.every((failure) => failure.code === 'no-captions')) {
     throw new TranscriptError(
       'This video has no English captions that the tutor can read. Paste the transcript instead.',
       'no-captions'
     )
   }
-  const segments = await captionsFor(track)
-  if (segments.length === 0) {
-    throw new TranscriptError(
-      "YouTube did not return readable captions for this video. Paste the video's transcript and the tutor will build the same lesson.",
-      'youtube-blocked'
-    )
-  }
-  const transcript = {
-    videoId,
-    sourceUrl,
-    title: metadata.title ?? 'YouTube tutorial',
-    creator: metadata.uploader ?? metadata.channel ?? 'Unknown creator',
-    publishedAt: publishedDate(metadata.upload_date),
-    language: track.name ?? 'en',
-    segments
-  }
-  cacheSet(videoId, transcript)
-  return transcript
+  console.warn('transcript extraction failed', JSON.stringify(failures))
+  throw new TranscriptError(
+    "YouTube is refusing this server's transcript requests right now. Paste the video's transcript below and the tutor will build the same lesson.",
+    'youtube-blocked'
+  )
 }
 
 function json(response, status, body) {
@@ -336,6 +357,8 @@ createServer(async (request, response) => {
       clients: PLAYER_CLIENTS,
       cookies: Boolean(COOKIES_FILE),
       proxy: Boolean(PROXY_URL),
+      potProvider: POT_BASE_URL || null,
+      pluginDirs: PLUGIN_DIRS || null,
       cached: transcriptCache.size
     })
     return
